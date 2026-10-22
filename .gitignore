@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.python-version
+
+# Virtual environments
+.venv
+
+# Claude
+.claude
+
+# Local output
+.pytest_cache/
+.ruff_cache/

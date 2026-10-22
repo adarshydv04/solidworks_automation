@@ -1,0 +1,34 @@
+[project]
+name = "solidworks-automation"
+version = "0.1.0"
+description = "MCP server that lets AI agents design parts and assemblies in SolidWorks"
+readme = "README.md"
+authors = [
+    { name = "adarshydv04", email = "299764@ust.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=1.12",
+    "pywin32>=306 ; sys_platform == 'win32'",
+]
+
+[project.scripts]
+solidworks-automation = "solidworks_automation:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["tests"]
+
+[tool.ruff]
+line-length = 120
