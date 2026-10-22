@@ -120,6 +120,10 @@ Do not expose the bridge to the internet.
 
 All lengths are millimetres and all angles are degrees. Model space is Y-up, with the Front plane at Z = 0.
 
+`sw_new_document` uses SolidWorks' default template. If none is configured, it searches
+`C:\ProgramData\SOLIDWORKS\SOLIDWORKS <year>\templates` and the install folder. To force a specific template, set
+`SW_MCP_PART_TEMPLATE` / `SW_MCP_ASSEMBLY_TEMPLATE` to its full path in the client config's `env` block.
+
 ## Safety model
 
 - **Starting SolidWorks needs the user's approval.** The server never closes SolidWorks or answers its dialogs.

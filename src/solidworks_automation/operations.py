@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import math
+import os
 import tempfile
 from itertools import pairwise
 from pathlib import Path
@@ -61,6 +62,32 @@ def _point2(p: list[float]) -> tuple[float, float]:
     if len(p) != 2:
         raise SolidWorksError(f"Expected a 2D sketch point [x, y] in mm, got {p}.")
     return _m(p[0]), _m(p[1])
+
+
+def find_template_file(suffix: str, year: int | None, install_dir: str | None) -> Path | None:
+    """Look for a template in the standard SolidWorks folders.
+
+    Searches this release's ProgramData templates first, then any release, then the
+    install folder (which ships tutorial templates). Prefers 'Part'/'Assembly' named files.
+    """
+    solidworks_data = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "SOLIDWORKS"
+    roots = []
+    if year:
+        roots.append(solidworks_data / f"SOLIDWORKS {year}" / "templates")
+    roots.append(solidworks_data)
+    if install_dir:
+        roots.append(Path(install_dir) / "lang")
+    preferred = {".prtdot": "part", ".asmdot": "assembly"}.get(suffix)
+
+    for root in roots:
+        if not root.is_dir():
+            continue
+        # Newest release folder first ("SOLIDWORKS 2026" sorts after "2025"), then preferred names first.
+        matches = sorted(root.rglob(f"*{suffix}"), key=str, reverse=True)
+        matches.sort(key=lambda p: p.stem.lower() != preferred)
+        if matches:
+            return matches[0]
+    return None
 
 
 class SolidWorksOps:
@@ -168,14 +195,37 @@ class SolidWorksOps:
 
     # --- documents ------------------------------------------------------------
 
+    def _release_year(self) -> int | None:
+        major = str(call(self._app, "RevisionNumber")).split(".")[0]
+        return int(major) + 1992 if major.isdigit() else None
+
+    def _template(self, kind: str) -> str:
+        """Find a document template: env override, SolidWorks settings, then the usual folders on disk."""
+        app = self._app
+        doc_type = c.DOC_PART if kind == "part" else c.DOC_ASSEMBLY
+        pref = c.PREF_DEFAULT_TEMPLATE_PART if kind == "part" else c.PREF_DEFAULT_TEMPLATE_ASSEMBLY
+        candidates = [os.environ.get(f"SW_MCP_{kind.upper()}_TEMPLATE"), call(app, "GetUserPreferenceStringValue", pref)]
+        try:
+            candidates.append(call(app, "GetDocumentTemplate", doc_type, "", 0, 0.0, 0.0))
+        except SolidWorksError:
+            pass  # not available on every release
+        for candidate in candidates:
+            if candidate and Path(candidate).is_file():
+                return candidate
+
+        found = find_template_file(c.TEMPLATE_SUFFIXES[kind], self._release_year(), call(app, "GetExecutablePath"))
+        if found is None:
+            raise SolidWorksError(
+                f"No {kind} template found. In SolidWorks set Tools > Options > System Options > Default Templates, "
+                f"or set SW_MCP_{kind.upper()}_TEMPLATE to the full path of a {c.TEMPLATE_SUFFIXES[kind]} file."
+            )
+        return str(found)
+
     def new_document(self, kind: str) -> dict:
         app = self._app_or_raise()
-        pref = {"part": c.PREF_DEFAULT_TEMPLATE_PART, "assembly": c.PREF_DEFAULT_TEMPLATE_ASSEMBLY}.get(kind)
-        if pref is None:
+        if kind not in c.TEMPLATE_SUFFIXES:
             raise SolidWorksError("kind must be 'part' or 'assembly'.")
-        template = call(app, "GetUserPreferenceStringValue", pref)
-        if not template:
-            raise SolidWorksError(f"No default {kind} template is configured in SolidWorks options.")
+        template = self._template(kind)
         model = call(app, "NewDocument", template, 0, 0.0, 0.0)
         if model is None:
             raise SolidWorksError(f"SolidWorks could not create a new {kind} from '{template}'.")

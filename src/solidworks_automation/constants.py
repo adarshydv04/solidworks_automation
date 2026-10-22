@@ -16,6 +16,8 @@ DOC_EXTENSIONS = {".sldprt": DOC_PART, ".sldasm": DOC_ASSEMBLY, ".slddrw": DOC_D
 PREF_DEFAULT_TEMPLATE_PART = 8
 PREF_DEFAULT_TEMPLATE_ASSEMBLY = 9
 
+TEMPLATE_SUFFIXES = {"part": ".prtdot", "assembly": ".asmdot"}
+
 # swOpenDocOptions_e
 OPEN_SILENT = 1
 OPEN_READ_ONLY = 2
