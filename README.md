@@ -47,13 +47,14 @@ cd C:\tools\solidworks_automation
 uv sync
 ```
 
-**Claude Desktop**: add to `%APPDATA%\Claude\claude_desktop_config.json`:
+**Claude Desktop**: add to `claude_desktop_config.json` (Settings → Developer → Edit Config). Use the full path to
+`uv.exe` (`(Get-Command uv).Source`); Claude Desktop may not see your PATH:
 
 ```json
 {
   "mcpServers": {
     "solidworks": {
-      "command": "uv",
+      "command": "C:\\Python312\\Scripts\\uv.exe",
       "args": ["--directory", "C:\\tools\\solidworks_automation", "run", "solidworks-automation"]
     }
   }
@@ -66,8 +67,18 @@ uv sync
 claude mcp add solidworks -- uv --directory C:\tools\solidworks_automation run solidworks-automation
 ```
 
-**Clients that connect over HTTP** (e.g. ChatGPT connectors): run
-`uv run solidworks-automation serve --transport streamable-http` and expose it to the client as that client requires.
+**OpenAI Codex (CLI and VS Code extension)**: add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.solidworks]
+command = 'C:\Python312\Scripts\uv.exe'
+args = ["--directory", 'C:\tools\solidworks_automation', "run", "solidworks-automation"]
+startup_timeout_sec = 60
+tool_timeout_sec = 600   # starting SolidWorks takes minutes
+```
+
+**Clients that connect over HTTP**: run `uv run solidworks-automation serve --transport streamable-http`
+(serves `http://127.0.0.1:8000/mcp`).
 
 ## Setup: macOS (SolidWorks in a Windows VM)
 
@@ -108,15 +119,20 @@ Do not expose the bridge to the internet.
 | `sw_status` | Installed/running, release, open documents. Call first. |
 | `sw_connect` | Attach to SolidWorks, or start it **after the user approves**. |
 | `sw_new_document`, `sw_open`, `sw_close` | Create, open, close parts/assemblies. |
-| `sw_create_sketch` | Lines, polylines, rectangles, circles, arcs, polygons, centerlines on a plane or face. |
-| `sw_extrude`, `sw_cut_extrude`, `sw_revolve` | Solid features (blind, mid-plane, through-all, draft). |
+| `sw_create_sketch` | Lines, polylines, rectangles, circles, arcs, polygons, slots, centerlines on a plane or face. Per-entity linear/circular patterns and mirroring. Optional model coordinates. |
+| `sw_extrude`, `sw_cut_extrude`, `sw_revolve` | Solid features (blind, mid-plane, through-all, up-to-next, start offset, draft). |
+| `sw_hole` | Simple, counterbore and countersink holes on a face. |
+| `sw_mirror` | Mirror features about a plane. |
 | `sw_create_plane` | Offset reference planes. |
 | `sw_fillet`, `sw_chamfer`, `sw_shell` | Edge and body finishing. Edges picked by model point or `"all"`. |
 | `sw_set_material`, `sw_set_dimension`, `sw_set_suppression`, `sw_delete_feature`, `sw_undo` | Edit the model. |
 | `sw_list_features`, `sw_rebuild`, `sw_mass_properties` | Inspect the feature tree, errors, mass, bounding box. |
-| `sw_screenshot` | Image of the model from a standard view, so the agent can check its work. |
+| `sw_list_entities` | Faces and edges with geometry and pick points, so the agent targets exact entities. |
+| `sw_screenshot` | Images from up to six standard views, so the agent can compare against a drawing. |
 | `sw_save`, `sw_export` | Native save; STEP, IGES, STL, Parasolid, 3MF, PDF, DXF/DWG, PNG/JPG export. |
 | `sw_insert_component`, `sw_add_mate`, `sw_list_components` | Build assemblies. |
+
+The server also provides a `model_from_drawing` prompt that guides agents through drawing → plan → build → verify.
 
 All lengths are millimetres and all angles are degrees. Model space is Y-up, with the Front plane at Z = 0.
 
@@ -137,27 +153,27 @@ All lengths are millimetres and all angles are degrees. Model space is Y-up, wit
 
 ## Limitations
 
-- No patterns, lofts, sweeps, Hole Wizard, sheet metal or drawings yet.
+- Patterns and mirrors work at sketch level. Feature patterns, lofts, sweeps, Hole Wizard (threads), sheet metal and
+  drawings are not supported yet.
 - Sketches have no dimensions or relations; geometry is placed at exact coordinates.
-- Sketching on a face uses that face's own sketch axes; prefer standard or offset planes.
-- **Not yet verified against a live SolidWorks install.** The COM calls follow the SolidWorks API documentation, but
-  the automated tests use a fake backend. Run `examples/live_smoke.py` on a SolidWorks machine to verify, and please
-  report anything that fails.
+- The COM calls follow the SolidWorks API documentation, but the automated tests use a fake backend. Run
+  `examples/live_smoke.py` on a SolidWorks machine to verify every feature, and please report anything that fails.
 
 ## Development
 
 ```powershell
 uv sync
-uv run pytest                          # server, permission flow, bridge, path policy (no SolidWorks needed)
+uv run pytest                          # server, permission flow, bridge, geometry, path policy (no SolidWorks needed)
 uv run python examples/live_smoke.py   # end-to-end against a real SolidWorks
 uvx ruff check src tests examples
 ```
 
 Layout (`src/solidworks_automation/`):
 
-- `server.py`: MCP tools, input schemas, permission prompts
+- `server.py`: MCP tools, input schemas, permission prompts, the drawing prompt
 - `backend.py`: local (COM thread) vs. remote (bridge) execution
 - `operations.py`: every SolidWorks API call; the only module that touches SolidWorks
+- `sketch_geometry.py`: slots, patterns and mirrors expanded into sketch primitives (pure Python)
 - `com.py`: late-bound `IDispatch` helpers, launch/attach, the COM thread
 - `bridge.py`: token-authenticated HTTP bridge for the VM setup
 - `safety.py`: file-write policy

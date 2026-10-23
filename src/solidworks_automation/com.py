@@ -98,6 +98,11 @@ def out_str() -> Any:
     return win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
 
 
+def double_array(values: Any) -> Any:
+    """A SAFEARRAY of doubles, as SolidWorks expects for point/vector data."""
+    return win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, [float(v) for v in values])
+
+
 def as_list(value: Any) -> list[Any]:
     """SolidWorks returns arrays as tuples, or None when empty."""
     if value is None:

@@ -21,6 +21,7 @@ from .com import (
     SolidWorksError,
     as_list,
     call,
+    double_array,
     empty,
     find_running_app,
     get,
@@ -33,6 +34,7 @@ from .com import (
     put,
 )
 from .safety import output_dir, resolve_write_path
+from .sketch_geometry import expand_entities
 
 HIDDEN_FEATURE_TYPES = {
     "OriginProfileFeature",
@@ -335,6 +337,7 @@ class SolidWorksOps:
         face_point: list[float] | None,
         entities: list[dict],
         name: str | None,
+        model_coordinates: bool = False,
     ) -> dict:
         model = self._part(doc)
         if not entities:
@@ -350,10 +353,16 @@ class SolidWorksOps:
         if get(skm, "ActiveSketch") is None:
             raise SolidWorksError("SolidWorks did not open a sketch on the selected plane/face.")
         put(skm, "AddToDB", True)
+        off_plane = [0.0]
         try:
-            for i, entity in enumerate(entities):
-                if not self._draw(skm, entity):
-                    raise SolidWorksError(f"Sketch entity {i} ({entity.get('type')}) could not be created.")
+            to_sketch = self._model_to_sketch(get(skm, "ActiveSketch"), off_plane) if model_coordinates else None
+            try:
+                primitives = expand_entities(entities, to_sketch)
+            except (ValueError, KeyError) as exc:
+                raise SolidWorksError(f"Invalid sketch entities: {exc}") from exc
+            for i, primitive in enumerate(primitives):
+                if not self._draw(skm, primitive):
+                    raise SolidWorksError(f"Sketch segment {i} ({primitive['type']}) could not be created.")
         except Exception:
             put(skm, "AddToDB", False)
             call(skm, "InsertSketch", True)
@@ -362,9 +371,30 @@ class SolidWorksOps:
         put(skm, "AddToDB", False)
         call(skm, "InsertSketch", True)
         sketch_name = self._record(model, None, name)
-        return {"sketch": sketch_name, "entities": len(entities)}
+        result = {"sketch": sketch_name, "entities": len(entities), "segments": len(primitives)}
+        if model_coordinates and off_plane[0] > 0.01:
+            result["warning"] = (
+                f"Some points were up to {off_plane[0]:.3f} mm off the sketch plane and were projected onto it."
+            )
+        return result
+
+    def _model_to_sketch(self, sketch: Any, off_plane: list[float]):
+        """Return a mapper from model-space mm [x, y, z] to sketch-space mm (x, y)."""
+        transform = get(sketch, "ModelToSketchTransform")
+        math_util = call(self._app, "GetMathUtility")
+
+        def to_sketch(p: list[float]) -> tuple[float, float]:
+            if len(p) != 3:
+                raise ValueError(f"With model_coordinates=true every point must be [x, y, z] in mm, got {p}.")
+            point = call(math_util, "CreatePoint", double_array(_point3(p)))
+            mapped = as_list(get(call(point, "MultiplyTransform", transform), "ArrayData"))
+            off_plane[0] = max(off_plane[0], abs(_mm(mapped[2])))
+            return _mm(mapped[0]), _mm(mapped[1])
+
+        return to_sketch
 
     def _draw(self, skm: Any, e: dict) -> bool:
+        """Draw one primitive from sketch_geometry.expand_entities (sketch-space mm)."""
         kind = e.get("type")
         if kind in ("line", "centerline"):
             (x1, y1), (x2, y2) = _point2(e["start"]), _point2(e["end"])
@@ -378,13 +408,6 @@ class SolidWorksOps:
                 if call(skm, "CreateLine", x1, y1, 0.0, x2, y2, 0.0) is None:
                     return False
             return True
-        if kind == "rectangle":
-            (x1, y1), (x2, y2) = _point2(e["corner1"]), _point2(e["corner2"])
-            return bool(as_list(call(skm, "CreateCornerRectangle", x1, y1, 0.0, x2, y2, 0.0)))
-        if kind == "center_rectangle":
-            cx, cy = _point2(e["center"])
-            hw, hh = _m(e["width"]) / 2, _m(e["height"]) / 2
-            return bool(as_list(call(skm, "CreateCenterRectangle", cx, cy, 0.0, cx + hw, cy + hh, 0.0)))
         if kind == "circle":
             cx, cy = _point2(e["center"])
             return call(skm, "CreateCircleByRadius", cx, cy, 0.0, _m(e["radius"])) is not None
@@ -392,11 +415,6 @@ class SolidWorksOps:
             (cx, cy), (sx, sy), (ex, ey) = _point2(e["center"]), _point2(e["start"]), _point2(e["end"])
             direction = -1 if e.get("clockwise") else 1
             return call(skm, "CreateArc", cx, cy, 0.0, sx, sy, 0.0, ex, ey, 0.0, direction) is not None
-        if kind == "polygon":
-            cx, cy = _point2(e["center"])
-            r = _m(e["radius"])
-            inscribed = e.get("inscribed", True)
-            return bool(as_list(call(skm, "CreatePolygon", cx, cy, 0.0, cx + r, cy, 0.0, int(e["sides"]), inscribed)))
         raise SolidWorksError(f"Unknown sketch entity type '{kind}'.")
 
     def extrude(
@@ -410,6 +428,7 @@ class SolidWorksOps:
         draft_angle: float,
         cut: bool,
         name: str | None,
+        start_offset: float | None = None,
     ) -> dict:
         model = self._part(doc)
         call(model, "ClearSelection2", True)
@@ -428,6 +447,10 @@ class SolidWorksOps:
         d1 = _m(depth) if depth else 0.0
         draft = math.radians(draft_angle or 0.0)
         use_draft = bool(draft_angle)
+        # Start condition: from the sketch plane, or offset from it (negative = opposite side).
+        t0 = c.START_OFFSET if start_offset else c.START_SKETCH_PLANE
+        offset = _m(abs(start_offset or 0.0))
+        flip_offset = bool(start_offset and start_offset < 0)
 
         fm = get(model, "FeatureManager")
         if cut:
@@ -437,7 +460,7 @@ class SolidWorksOps:
                 use_draft, use_draft and not single, False, False, draft, draft,
                 False, False, False, False,
                 False, True, True, False, False, False,
-                0, 0.0, False, False,
+                t0, offset, flip_offset, False,
             )
         else:
             feature = call(
@@ -446,7 +469,7 @@ class SolidWorksOps:
                 use_draft, use_draft and not single, False, False, draft, draft,
                 False, False, False, False,
                 True, True, True,
-                0, 0.0, False,
+                t0, offset, flip_offset,
             )
         if feature is None:
             what = "Cut" if cut else "Extrude"
@@ -579,6 +602,163 @@ class SolidWorksOps:
         model = self._doc(doc)
         call(model, "EditUndo2", int(steps))
         return {"undone_steps": steps}
+
+    def mirror(self, doc: str | None, features: list[str], plane: str, name: str | None) -> dict:
+        model = self._part(doc)
+        if not features:
+            raise SolidWorksError("List at least one feature to mirror.")
+        call(model, "ClearSelection2", True)
+        for feature in features:
+            call(self._feature_by_name(model, feature), "Select2", True, 1)
+        self._select_plane(model, plane, append=True, mark=2)
+        fm = get(model, "FeatureManager")
+        try:
+            result = call(fm, "InsertMirrorFeature2", False, False, False, False, 0)
+        except SolidWorksError:
+            result = call(fm, "InsertMirrorFeature", False, False, False, False)
+        if result is None:
+            raise SolidWorksError(f"Mirror of {features} about '{plane}' failed.")
+        return {"feature": self._record(model, result, name)}
+
+    def hole(
+        self,
+        doc: str | None,
+        face_point: list[float],
+        positions: list[list[float]],
+        diameter: float,
+        depth: float | None,
+        hole_type: str,
+        counterbore_diameter: float | None,
+        counterbore_depth: float | None,
+        countersink_diameter: float | None,
+        countersink_angle: float,
+        name: str | None,
+    ) -> dict:
+        """Holes on a planar face, built from sketches and cuts (simple, counterbore, countersink)."""
+        if not positions:
+            raise SolidWorksError("Give at least one hole position.")
+        widest = max(diameter, counterbore_diameter or 0.0, countersink_diameter or 0.0) / 2
+        for position in positions:
+            if math.dist(position, face_point) <= widest + 0.5:
+                raise SolidWorksError(
+                    "face_point lies inside a hole. Pick a point on the same face away from all holes."
+                )
+
+        def cut(radius: float, cut_depth: float | None, draft: float = 0.0, label: str = "") -> str:
+            circles = [{"type": "circle", "center": p, "radius": radius} for p in positions]
+            sketch = self.create_sketch(doc, None, face_point, circles, None, model_coordinates=True)["sketch"]
+            end = "blind" if cut_depth else "through_all"
+            feature_name = f"{name}{label}" if name else None
+            return self.extrude(
+                doc, sketch, cut_depth or 0.0, end, False, None, draft, True, feature_name
+            )["feature"]
+
+        features = []
+        if hole_type == "counterbore":
+            if not counterbore_diameter or not counterbore_depth or counterbore_diameter <= diameter:
+                raise SolidWorksError("Counterbores need counterbore_diameter (> diameter) and counterbore_depth.")
+            features.append(cut(counterbore_diameter / 2, counterbore_depth, label="-Counterbore"))
+        elif hole_type == "countersink":
+            if not countersink_diameter or countersink_diameter <= diameter:
+                raise SolidWorksError("Countersinks need countersink_diameter (> diameter).")
+            half = math.radians(countersink_angle / 2)
+            sink_depth = (countersink_diameter - diameter) / 2 / math.tan(half)
+            # Draft is measured from the cut direction, so it equals the countersink half-angle.
+            features.append(cut(countersink_diameter / 2, sink_depth, countersink_angle / 2, "-Countersink"))
+        elif hole_type != "simple":
+            raise SolidWorksError("hole_type must be 'simple', 'counterbore' or 'countersink'.")
+        features.append(cut(diameter / 2, depth, label="-Hole"))
+        return {"features": features, "holes": len(positions)}
+
+    def list_entities(
+        self,
+        doc: str | None,
+        kind: str,
+        near: list[float] | None,
+        limit: int,
+    ) -> dict:
+        """Faces and edges with geometry and a pick point usable by other tools."""
+        model = self._part(doc)
+        faces, edges = [], []
+        for body in as_list(call(model, "GetBodies2", 0, True)):
+            if kind in ("faces", "all"):
+                faces += [self._describe_face(f) for f in as_list(call(body, "GetFaces"))]
+            if kind in ("edges", "all"):
+                edges += [self._describe_edge(e) for e in as_list(call(body, "GetEdges"))]
+
+        def ranked(items: list[dict]) -> list[dict]:
+            items = [i for i in items if i.get("pick_point")]
+            if near is not None:
+                items.sort(key=lambda i: math.dist(i["pick_point"], near))
+            return items[:limit]
+
+        result: dict[str, Any] = {"document": call(model, "GetTitle")}
+        if kind in ("faces", "all"):
+            result["faces"] = ranked(faces)
+            result["face_count"] = len(faces)
+        if kind in ("edges", "all"):
+            result["edges"] = ranked(edges)
+            result["edge_count"] = len(edges)
+        return result
+
+    def _describe_face(self, face: Any) -> dict:
+        info: dict[str, Any] = {"type": "other"}
+        try:
+            info["area_mm2"] = round(call(face, "GetArea") * 1e6, 3)
+            surface = call(face, "GetSurface")
+            if call(surface, "IsPlane"):
+                info["type"] = "plane"
+                info["normal"] = [round(v, 6) for v in as_list(get(face, "Normal"))[:3]]
+            elif call(surface, "IsCylinder"):
+                params = as_list(get(surface, "CylinderParams"))
+                info.update(
+                    type="cylinder",
+                    axis_point=[_mm(v) for v in params[:3]],
+                    axis=[round(v, 6) for v in params[3:6]],
+                    diameter=round(_mm(params[6]) * 2, 6),
+                )
+            info["pick_point"] = self._face_point(face)
+        except SolidWorksError as exc:
+            info["error"] = str(exc)
+        return info
+
+    def _face_point(self, face: Any) -> list[float] | None:
+        """A point strictly inside the face: centroid of its largest tessellation triangle."""
+        coords = as_list(call(face, "GetTessTriangles", True))
+        best, best_area = None, -1.0
+        for i in range(0, len(coords) - 8, 9):
+            a, b, c3 = coords[i:i + 3], coords[i + 3:i + 6], coords[i + 6:i + 9]
+            ab = [b[k] - a[k] for k in range(3)]
+            ac = [c3[k] - a[k] for k in range(3)]
+            cross = [ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]]
+            area = math.hypot(*cross)
+            if area > best_area:
+                best_area, best = area, [_mm((a[k] + b[k] + c3[k]) / 3) for k in range(3)]
+        return best
+
+    def _describe_edge(self, edge: Any) -> dict:
+        info: dict[str, Any] = {"type": "other"}
+        try:
+            curve = call(edge, "GetCurve")
+            params = as_list(call(edge, "GetCurveParams2"))
+            start, end, t0, t1 = params[0:3], params[3:6], params[6], params[7]
+            info["start"] = [_mm(v) for v in start]
+            info["end"] = [_mm(v) for v in end]
+            info["pick_point"] = [_mm(v) for v in as_list(call(curve, "Evaluate2", (t0 + t1) / 2, 0))[:3]]
+            info["length_mm"] = round(_mm(call(curve, "GetLength3", t0, t1)), 6)
+            if call(curve, "IsLine"):
+                info["type"] = "line"
+            elif call(curve, "IsCircle"):
+                circle = as_list(get(curve, "CircleParams"))
+                info.update(
+                    type="circle",
+                    center=[_mm(v) for v in circle[:3]],
+                    axis=[round(v, 6) for v in circle[3:6]],
+                    diameter=round(_mm(circle[6]) * 2, 6),
+                )
+        except SolidWorksError as exc:
+            info["error"] = str(exc)
+        return info
 
     # --- inspection -----------------------------------------------------------
 
@@ -774,6 +954,7 @@ class SolidWorksOps:
 OPERATIONS = frozenset({
     "status", "connect", "new_document", "open_document", "close_document",
     "create_sketch", "extrude", "revolve", "create_plane", "fillet", "chamfer", "shell",
+    "mirror", "hole", "list_entities",
     "set_material", "delete_feature", "set_suppression", "set_dimension", "undo",
     "list_features", "rebuild", "mass_properties", "screenshot", "save", "export",
     "insert_component", "add_mate", "list_components",

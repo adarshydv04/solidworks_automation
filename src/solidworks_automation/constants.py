@@ -31,7 +31,17 @@ SAVE_AS_COPY = 2
 END_BLIND = 0
 END_THROUGH_ALL = 1
 END_MID_PLANE = 6
-END_CONDITIONS = {"blind": END_BLIND, "through_all": END_THROUGH_ALL, "mid_plane": END_MID_PLANE}
+END_UP_TO_NEXT = 2
+END_CONDITIONS = {
+    "blind": END_BLIND,
+    "through_all": END_THROUGH_ALL,
+    "up_to_next": END_UP_TO_NEXT,
+    "mid_plane": END_MID_PLANE,
+}
+
+# swStartConditions_e
+START_SKETCH_PLANE = 0
+START_OFFSET = 3
 
 # swRefPlaneReferenceConstraints_e
 REF_PLANE_DISTANCE = 8
