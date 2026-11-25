@@ -82,7 +82,7 @@ def _to_primitives(e: dict) -> list[dict]:
     if kind in ("line", "centerline"):
         return [{"type": kind, "start": e["start"], "end": e["end"]}]
     if kind == "polyline":
-        return [{"type": "polyline", "points": list(e["points"]), "closed": e.get("closed", True)}]
+        return _outline(e, list(e["points"]), e.get("closed", True))
     if kind == "circle":
         return [{"type": "circle", "center": e["center"], "radius": float(e["radius"])}]
     if kind == "arc":
@@ -90,24 +90,95 @@ def _to_primitives(e: dict) -> list[dict]:
                  "clockwise": bool(e.get("clockwise"))}]
     if kind == "rectangle":
         (x1, y1), (x2, y2) = e["corner1"], e["corner2"]
-        return [{"type": "polyline", "points": [(x1, y1), (x2, y1), (x2, y2), (x1, y2)], "closed": True}]
+        return _outline(e, [(x1, y1), (x2, y1), (x2, y2), (x1, y2)], True)
     if kind == "center_rectangle":
         (cx, cy), hw, hh = e["center"], e["width"] / 2, e["height"] / 2
         corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
         angle = math.radians(e.get("angle", 0.0))
         points = [(cx + x * math.cos(angle) - y * math.sin(angle), cy + x * math.sin(angle) + y * math.cos(angle))
                   for x, y in corners]
-        return [{"type": "polyline", "points": points, "closed": True}]
+        return _outline(e, points, True)
     if kind == "polygon":
         (cx, cy), sides = e["center"], int(e["sides"])
         r = e["radius"] if e.get("inscribed", True) else e["radius"] / math.cos(math.pi / sides)
         start = math.radians(e.get("angle", 0.0))
         points = [(cx + r * math.cos(start + 2 * math.pi * i / sides), cy + r * math.sin(start + 2 * math.pi * i / sides))
                   for i in range(sides)]
-        return [{"type": "polyline", "points": points, "closed": True}]
+        return _outline(e, points, True)
     if kind == "slot":
         return _slot(e["center1"], e["center2"], e["width"] / 2)
     raise ValueError(f"Unknown sketch entity type '{kind}'.")
+
+
+def _outline(e: dict, points: list[Point], closed: bool) -> list[dict]:
+    """A polyline, with optional rounded (fillet) or chamfered corners.
+
+    `corner_radius` rounds every corner; `corners` gives one entry per point:
+    None, {"radius": r} or {"chamfer": d}. Ends of an open polyline are never rounded.
+    """
+    corners = e.get("corners")
+    if corners is None and e.get("corner_radius"):
+        corners = [{"radius": e["corner_radius"]}] * len(points)
+    if not corners or not any(corners):
+        return [{"type": "polyline", "points": points, "closed": closed}]
+    if len(corners) != len(points):
+        raise ValueError(f"corners has {len(corners)} entries but the outline has {len(points)} points.")
+
+    n = len(points)
+    # Per vertex: (point where the incoming edge stops, point where the outgoing edge starts, trim distance)
+    trims: list[tuple[Point, Point, float] | None] = [None] * n
+    pieces: list[dict] = []
+    for i, spec in enumerate(corners):
+        if not spec or (not closed and i in (0, n - 1)):
+            continue
+        prev, here, nxt = points[i - 1], points[i], points[(i + 1) % n]
+        u1, len1 = _unit(here, prev)
+        u2, len2 = _unit(here, nxt)
+        if len1 < 1e-9 or len2 < 1e-9:
+            raise ValueError(f"Point {i} repeats its neighbour; remove the duplicate point.")
+        half = math.acos(max(-1.0, min(1.0, u1[0] * u2[0] + u1[1] * u2[1]))) / 2
+        if half > math.pi / 2 - 1e-6:
+            continue  # straight through: nothing to round
+        if spec.get("radius"):
+            r = float(spec["radius"])
+            trim = r / math.tan(half)
+            t_in, t_out = _along(here, u1, trim), _along(here, u2, trim)
+            bisector, _ = _unit((0.0, 0.0), (u1[0] + u2[0], u1[1] + u2[1]))
+            center = _along(here, bisector, r / math.sin(half))
+            cross = (t_in[0] - center[0]) * (t_out[1] - center[1]) - (t_in[1] - center[1]) * (t_out[0] - center[0])
+            pieces.append({"type": "arc", "center": center, "start": t_in, "end": t_out, "clockwise": cross < 0})
+        elif spec.get("chamfer"):
+            trim = float(spec["chamfer"])
+            t_in, t_out = _along(here, u1, trim), _along(here, u2, trim)
+            pieces.append({"type": "line", "start": t_in, "end": t_out})
+        else:
+            continue
+        trims[i] = (t_in, t_out, trim)
+
+    edges = range(n) if closed else range(n - 1)
+    for i in edges:
+        j = (i + 1) % n
+        start = trims[i][1] if trims[i] else points[i]
+        end = trims[j][0] if trims[j] else points[j]
+        used = (trims[i][2] if trims[i] else 0.0) + (trims[j][2] if trims[j] else 0.0)
+        if used > math.dist(points[i], points[j]) + 1e-6:
+            raise ValueError(
+                f"Corner radius/chamfer at points {i} and {j} is too large for the {math.dist(points[i], points[j]):g} mm "
+                "segment between them."
+            )
+        if math.dist(start, end) > 1e-9:
+            pieces.append({"type": "line", "start": start, "end": end})
+    return pieces
+
+
+def _unit(origin: Point, toward: Point) -> tuple[Point, float]:
+    dx, dy = toward[0] - origin[0], toward[1] - origin[1]
+    length = math.hypot(dx, dy)
+    return ((dx / length, dy / length) if length else (0.0, 0.0)), length
+
+
+def _along(origin: Point, direction: Point, distance: float) -> Point:
+    return origin[0] + direction[0] * distance, origin[1] + direction[1] * distance
 
 
 def _slot(c1: Point, c2: Point, r: float) -> list[dict]:

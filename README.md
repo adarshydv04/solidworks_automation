@@ -119,7 +119,8 @@ Do not expose the bridge to the internet.
 | `sw_status` | Installed/running, release, open documents. Call first. |
 | `sw_connect` | Attach to SolidWorks, or start it **after the user approves**. |
 | `sw_new_document`, `sw_open`, `sw_close` | Create, open, close parts/assemblies. |
-| `sw_create_sketch` | Lines, polylines, rectangles, circles, arcs, polygons, slots, centerlines on a plane or face. Per-entity linear/circular patterns and mirroring. Optional model coordinates. |
+| `sw_build` | Run a whole feature plan in one call, with `$id` references between steps. If a step fails, everything the plan created is rolled back and the failing step is named. Best for complex parts. |
+| `sw_create_sketch` | Lines, polylines, rectangles, circles, arcs, polygons, slots, centerlines on a plane or face. Rounded or chamfered outline corners, per-entity linear/circular patterns and mirroring. Optional model coordinates. |
 | `sw_extrude`, `sw_cut_extrude`, `sw_revolve` | Solid features (blind, mid-plane, through-all, up-to-next, start offset, draft). |
 | `sw_hole` | Simple, counterbore and countersink holes on a face. |
 | `sw_mirror` | Mirror features about a plane. |

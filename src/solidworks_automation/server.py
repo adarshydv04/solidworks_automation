@@ -33,7 +33,7 @@ Typical part: sketch on 'front' -> sw_extrude -> sketch holes on 'front' -> sw_c
 end_condition 'through_all_both' -> sw_fillet. Feature changes happen in memory; nothing is
 written to disk until sw_save or sw_export.
 
-Complex parts - work like a CAD engineer:
+Complex parts - work like a CAD engineer, and prefer sw_build to send the whole plan at once:
 1. Plan first: list the features in build order and state key dimensions before calling tools.
 2. Base feature from the most descriptive view: trace that view's whole outline as one closed
    polyline (steps, slopes and chamfers included) on the matching plane and extrude it by the
@@ -44,6 +44,8 @@ Complex parts - work like a CAD engineer:
 5. After every few features: sw_rebuild for errors, sw_mass_properties bounding box for size, and
    sw_screenshot with the views matching the drawing to compare. Fix with sw_undo or sw_delete_feature.
 6. Symmetric parts: build one half and sw_mirror it, or use mirror_about in sketches.
+7. Rounded profile corners (R dimensions on a drawing): use corner_radius / corners on the outline
+   instead of computing arcs yourself.
 """
 
 mcp = MCPServer("solidworks", instructions=INSTRUCTIONS)
@@ -185,7 +187,21 @@ class Centerline(EntityBase):
     end: SketchPoint
 
 
-class Polyline(EntityBase):
+class Corner(BaseModel):
+    """Round (radius) or bevel (chamfer) one outline corner."""
+
+    radius: float | None = Field(default=None, gt=0)
+    chamfer: float | None = Field(default=None, gt=0, description="Equal-distance chamfer length in mm.")
+
+
+class Outline(EntityBase):
+    corner_radius: float | None = Field(default=None, gt=0, description="Round every corner with this radius (mm).")
+    corners: list[Corner | None] | None = Field(
+        default=None, description="One entry per point/corner (null = sharp); overrides corner_radius."
+    )
+
+
+class Polyline(Outline):
     """Connected straight segments - ideal for tracing a whole outline from a drawing view."""
 
     type: Literal["polyline"]
@@ -193,13 +209,13 @@ class Polyline(EntityBase):
     closed: bool = True
 
 
-class Rectangle(EntityBase):
+class Rectangle(Outline):
     type: Literal["rectangle"]
     corner1: SketchPoint
     corner2: SketchPoint
 
 
-class CenterRectangle(EntityBase):
+class CenterRectangle(Outline):
     type: Literal["center_rectangle"]
     center: SketchPoint
     width: float = Field(gt=0)
@@ -223,7 +239,7 @@ class Arc(EntityBase):
     clockwise: bool = False
 
 
-class Polygon(EntityBase):
+class Polygon(Outline):
     type: Literal["polygon"]
     center: SketchPoint
     radius: float = Field(gt=0, description="Distance from center to a vertex (inscribed) or edge midpoint.")
@@ -449,6 +465,133 @@ async def sw_hole(
         hole_type=hole_type, counterbore_diameter=counterbore_diameter, counterbore_depth=counterbore_depth,
         countersink_diameter=countersink_diameter, countersink_angle=countersink_angle, name=name,
     )
+
+
+# --- multi-step builds ---------------------------------------------------------------
+
+StepRef = Annotated[str, Field(description="A name like 'Sketch1', or '$<id>' of an earlier step in this plan.")]
+
+
+class StepBase(BaseModel):
+    id: str | None = Field(default=None, description="Name this step so later steps can refer to it as '$id'.")
+    name: FeatureName = None
+
+
+class SketchStep(StepBase):
+    op: Literal["sketch"]
+    entities: list[SketchEntity] = Field(min_length=1)
+    plane: str = "front"
+    face_point: Point3 | None = None
+    model_coordinates: bool = False
+
+
+class ExtrudeStep(StepBase):
+    op: Literal["extrude"]
+    sketch: StepRef
+    depth: float = Field(gt=0)
+    end_condition: Literal["blind", "mid_plane", "up_to_next"] = "blind"
+    reverse: bool = False
+    second_depth: float | None = Field(default=None, gt=0)
+    draft_angle: float = Field(default=0, ge=0, lt=89)
+    start_offset: float | None = None
+
+
+class CutStep(StepBase):
+    op: Literal["cut"]
+    sketch: StepRef
+    end_condition: EndCondition = "through_all_both"
+    depth: float | None = Field(default=None, gt=0)
+    reverse: bool = False
+    draft_angle: float = Field(default=0, ge=0, lt=89)
+    start_offset: float | None = None
+
+
+class RevolveStep(StepBase):
+    op: Literal["revolve"]
+    sketch: StepRef
+    angle: float = Field(default=360, gt=0, le=360)
+    reverse: bool = False
+    cut: bool = False
+
+
+class PlaneStep(StepBase):
+    op: Literal["plane"]
+    offset: float = Field(gt=0)
+    base: str = "front"
+    reverse: bool = False
+
+
+class FilletStep(StepBase):
+    op: Literal["fillet"]
+    radius: float = Field(gt=0)
+    edges: Edges = "all"
+
+
+class ChamferStep(StepBase):
+    op: Literal["chamfer"]
+    distance: float = Field(gt=0)
+    angle: float = Field(default=45, gt=0, lt=90)
+    edges: Edges = "all"
+
+
+class ShellStep(StepBase):
+    op: Literal["shell"]
+    thickness: float = Field(gt=0)
+    remove_face_points: list[Point3] = []
+    outward: bool = False
+
+
+class HoleStep(StepBase):
+    op: Literal["hole"]
+    face_point: Point3
+    positions: list[Point3] = Field(min_length=1)
+    diameter: float = Field(gt=0)
+    depth: float | None = Field(default=None, gt=0)
+    hole_type: Literal["simple", "counterbore", "countersink"] = "simple"
+    counterbore_diameter: float | None = Field(default=None, gt=0)
+    counterbore_depth: float | None = Field(default=None, gt=0)
+    countersink_diameter: float | None = Field(default=None, gt=0)
+    countersink_angle: float = Field(default=90, gt=0, lt=180)
+
+
+class MirrorStep(StepBase):
+    op: Literal["mirror"]
+    features: list[StepRef] = Field(min_length=1)
+    plane: str
+
+
+class MaterialStep(BaseModel):
+    op: Literal["material"]
+    id: str | None = None
+    material: str
+    database: str = "solidworks materials.sldmat"
+
+
+BuildStep = Annotated[
+    SketchStep | ExtrudeStep | CutStep | RevolveStep | PlaneStep | FilletStep | ChamferStep | ShellStep
+    | HoleStep | MirrorStep | MaterialStep,
+    Field(discriminator="op"),
+]
+
+
+@mcp.tool(annotations=EDITS)
+async def sw_build(
+    steps: Annotated[list[BuildStep], Field(min_length=1, max_length=100)],
+    rollback_on_error: Annotated[
+        bool, Field(description="If a step fails, delete everything this plan created (recommended).")
+    ] = True,
+    doc: Doc = None,
+) -> dict:
+    """Build a part from a whole feature plan in one call - the best way to make complex parts.
+
+    Steps run in order (sketch, extrude, cut, revolve, plane, fillet, chamfer, shell, hole, mirror,
+    material) with the same options as the single tools. Give a step an `id` and refer to its
+    result later as "$id" (e.g. extrude sketch "$base"). If a step fails, the error names it and, by
+    default, the model is restored to how it was before the plan - fix that step and resend the
+    plan. Returns each step's result plus rebuild problems and the final bounding box.
+    """
+    payload = [step.model_dump(exclude_none=True) for step in steps]
+    return await run("build", doc=doc, steps=payload, rollback_on_error=rollback_on_error)
 
 
 @mcp.tool(annotations=EDITS)
@@ -717,8 +860,10 @@ def model_from_drawing(units: Literal["inch", "mm"] = "mm", notes: str = "") -> 
    Y up) and its top view to the Top plane.
 3. Write a feature plan in build order, e.g. base extrude from the side profile, cuts, holes, fillets.
    Prefer one base feature that traces the most descriptive view's full outline as a closed polyline.
-4. Build it: sw_status / sw_connect, sw_new_document, then one feature at a time. Use sw_list_entities
-   to target faces and edges, model_coordinates=true for sketches on faces, sw_hole for holes.
+4. Build it: sw_status / sw_connect, sw_new_document, then send the plan with sw_build (use step ids
+   and "$id" references). If a step fails the plan is rolled back - fix that step and resend. Use
+   sw_list_entities to target faces and edges, model_coordinates=true for sketches on faces,
+   corner_radius for rounded outline corners, and hole steps for holes.
 5. Verify: sw_rebuild, sw_mass_properties (bounding box must match step 1), and sw_screenshot with the
    same views as the drawing. Compare them with the drawing view by view and fix any difference.
 6. Summarise what was built, any assumptions, and anything that differs from the drawing.

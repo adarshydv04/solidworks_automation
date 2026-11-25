@@ -103,6 +103,36 @@ def main() -> None:
         step(f"screenshot {view}", "screenshot", doc=None, view=view)
     step("export STEP", "export", doc=None, file_format="step", path="live_smoke_plate.step", overwrite=True)
 
+    # sw_build: a sloped bracket with a rounded corner, holes and an edge fillet, in one plan.
+    step("new part for build", "new_document", kind="part")
+    plan = [
+        {"op": "sketch", "id": "profile", "entities": [{
+            "type": "polyline", "points": [[0, 0], [100, 0], [100, 10], [70, 40], [0, 40]],
+            "corners": [None, None, None, {"radius": 3}, None],
+        }]},
+        {"op": "extrude", "sketch": "$profile", "depth": 60, "end_condition": "mid_plane"},
+        {"op": "hole", "face_point": [10, 40, 0], "positions": [[30, 40, -15], [30, 40, 15]], "diameter": 10},
+        {"op": "fillet", "radius": 2, "edges": [[0, 0, 0]]},
+    ]
+    step("build plan", "build", doc=None, steps=plan, rollback_on_error=True)
+
+    # A plan whose cut misses the part must fail AND leave the model exactly as it was.
+    before = step("feature count before failing plan", "list_features", doc=None, include_dimensions=False)
+    bad_plan = [
+        {"op": "sketch", "id": "far", "entities": [{"type": "circle", "center": [500, 500], "radius": 5}]},
+        {"op": "cut", "sketch": "$far", "end_condition": "blind", "depth": 5},
+    ]
+    try:
+        thread.submit(ops.build, doc=None, steps=bad_plan, rollback_on_error=True).result()
+        failures.append("rollback")
+        print("FAILED rollback: the bad plan unexpectedly succeeded")
+    except Exception as exc:  # noqa: BLE001
+        after = step("feature count after rollback", "list_features", doc=None, include_dimensions=False)
+        restored = before and after and len(before["features"]) == len(after["features"])
+        print(f"{'OK    ' if restored else 'FAILED'} rollback: {exc}")
+        if not restored:
+            failures.append("rollback")
+
     thread.shutdown()
     print()
     print("All steps passed." if not failures else f"{len(failures)} step(s) failed: {', '.join(failures)}")

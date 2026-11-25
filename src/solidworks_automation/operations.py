@@ -66,6 +66,66 @@ def _point2(p: list[float]) -> tuple[float, float]:
     return _m(p[0]), _m(p[1])
 
 
+# sw_build step op -> (SolidWorksOps method, defaults for arguments the step may leave out)
+STEP_CALLS: dict[str, tuple[str, dict[str, Any]]] = {
+    "sketch": ("create_sketch", {"plane": "front", "face_point": None, "model_coordinates": False, "name": None}),
+    "extrude": ("extrude", {
+        "end_condition": "blind", "reverse": False, "second_depth": None, "draft_angle": 0.0,
+        "start_offset": None, "name": None, "cut": False,
+    }),
+    "cut": ("extrude", {
+        "depth": 0.0, "end_condition": "through_all_both", "reverse": False, "second_depth": None,
+        "draft_angle": 0.0, "start_offset": None, "name": None, "cut": True,
+    }),
+    "revolve": ("revolve", {"angle": 360.0, "reverse": False, "cut": False, "name": None}),
+    "plane": ("create_plane", {"base": "front", "reverse": False, "name": None}),
+    "fillet": ("fillet", {"edges": "all", "name": None}),
+    "chamfer": ("chamfer", {"angle": 45.0, "edges": "all", "name": None}),
+    "shell": ("shell", {"remove_face_points": [], "outward": False, "name": None}),
+    "hole": ("hole", {
+        "depth": None, "hole_type": "simple", "counterbore_diameter": None, "counterbore_depth": None,
+        "countersink_diameter": None, "countersink_angle": 90.0, "name": None,
+    }),
+    "mirror": ("mirror", {"name": None}),
+    "material": ("set_material", {"database": "solidworks materials.sldmat"}),
+}
+REFERENCE_FIELDS = ("sketch", "plane", "base", "features")
+
+
+def _step_call(step: dict, outputs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Turn one sw_build step into a method name and keyword arguments, resolving $id references."""
+    op = step.get("op")
+    if op not in STEP_CALLS:
+        raise ValueError(f"Unknown step op '{op}'. Use one of {sorted(STEP_CALLS)}.")
+    method, defaults = STEP_CALLS[op]
+    kwargs = {**defaults, **{k: v for k, v in step.items() if k not in ("op", "id") and v is not None}}
+    if op in ("extrude", "cut") and kwargs.get("end_condition") in ("blind", "mid_plane") and not kwargs.get("depth"):
+        raise ValueError("depth is required for blind and mid_plane end conditions.")
+    for field in REFERENCE_FIELDS:
+        if field in kwargs:
+            kwargs[field] = _resolve(kwargs[field], outputs)
+    return method, kwargs
+
+
+def _resolve(value: Any, outputs: dict[str, Any]) -> Any:
+    if isinstance(value, list):
+        resolved = [_resolve(v, outputs) for v in value]
+        return [x for v in resolved for x in (v if isinstance(v, list) else [v])]
+    if isinstance(value, str) and value.startswith("$"):
+        ref = value[1:]
+        if ref not in outputs:
+            raise ValueError(f"'{value}' does not match the id of an earlier step.")
+        return outputs[ref]
+    return value
+
+
+def _primary_output(result: dict) -> Any:
+    for key in ("sketch", "feature", "plane", "features", "material"):
+        if key in result:
+            return result[key]
+    return None
+
+
 def find_template_file(suffix: str, year: int | None, install_dir: str | None) -> Path | None:
     """Look for a template in the standard SolidWorks folders.
 
@@ -578,6 +638,58 @@ class SolidWorksOps:
         self._created[title].discard(feature)
         return {"deleted": feature}
 
+    # --- multi-step builds --------------------------------------------------------
+
+    def build(self, doc: str | None, steps: list[dict], rollback_on_error: bool) -> dict:
+        """Run a feature plan step by step; on failure, remove everything this plan created.
+
+        Steps may refer to an earlier step's sketch/feature/plane as "$<id>".
+        """
+        model = self._part(doc)
+        title = call(model, "GetTitle")
+        before = set(self._created.get(title, set()))
+        outputs: dict[str, Any] = {}
+        results = []
+        for index, step in enumerate(steps):
+            label = f"step {index + 1} ({step.get('op')}{', id ' + step['id'] if step.get('id') else ''})"
+            try:
+                method, kwargs = _step_call(step, outputs)
+                result = getattr(self, method)(doc=doc, **kwargs)
+            except Exception as exc:  # any failure must roll the plan back
+                detail = f"{label} failed: {exc}"
+                if not rollback_on_error:
+                    raise SolidWorksError(f"{detail} Steps 1-{index} were kept: {results}") from exc
+                removed = self._roll_back(model, title, before)
+                raise SolidWorksError(
+                    f"{detail} Rolled back the {index} completed step(s) ({len(removed)} features removed); "
+                    "fix this step and send the whole plan again."
+                ) from exc
+            if step.get("id"):
+                outputs[step["id"]] = _primary_output(result)
+            results.append({"step": index + 1, **({"id": step["id"]} if step.get("id") else {}), **result})
+
+        summary: dict[str, Any] = {"steps": results, "rebuild": self.rebuild(doc)}
+        try:
+            summary["bounding_box_mm"] = self.mass_properties(doc).get("bounding_box_mm")
+        except SolidWorksError:
+            pass  # no solid body yet (sketch-only plan)
+        return summary
+
+    def _roll_back(self, model: Any, title: str, keep: set[str]) -> list[str]:
+        """Delete features created since `keep`, newest first, children and absorbed sketches included."""
+        created = self._created.get(title, set())
+        removed = []
+        for feat in reversed(self._features(model)):
+            name = get(feat, "Name")
+            if name not in created or name in keep:
+                continue
+            call(model, "ClearSelection2", True)
+            if call(feat, "Select2", False, 0) and call(get(model, "Extension"), "DeleteSelection2", 3):
+                removed.append(name)
+        call(model, "ClearSelection2", True)
+        self._created[title] = {n for n in created if n in keep}
+        return removed
+
     def set_suppression(self, doc: str | None, feature: str, suppressed: bool) -> dict:
         model = self._doc(doc)
         call(model, "ClearSelection2", True)
@@ -954,7 +1066,7 @@ class SolidWorksOps:
 OPERATIONS = frozenset({
     "status", "connect", "new_document", "open_document", "close_document",
     "create_sketch", "extrude", "revolve", "create_plane", "fillet", "chamfer", "shell",
-    "mirror", "hole", "list_entities",
+    "mirror", "hole", "list_entities", "build",
     "set_material", "delete_feature", "set_suppression", "set_dimension", "undo",
     "list_features", "rebuild", "mass_properties", "screenshot", "save", "export",
     "insert_component", "add_mate", "list_components",
